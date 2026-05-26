@@ -765,6 +765,25 @@ async def init_all_tables() -> bool:
         
         logger.debug("Таблица family_settings проверена/создана")
         
+        # Таблица news_requests (для системы модерации новостей)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS news_requests (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                author_id BIGINT NOT NULL,
+                content TEXT NOT NULL,
+                image_url VARCHAR(512) NULL,
+                status ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'pending',
+                moderator_id BIGINT NULL,
+                channel_message_id BIGINT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_status (status),
+                INDEX idx_author (author_id),
+                INDEX idx_moderator (moderator_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        logger.debug("Таблица news_requests проверена/создана")
+        
         connection.commit()
         logger.info("✅ Все таблицы базы данных проверены/созданы")
         return True
@@ -1057,3 +1076,157 @@ def ping_db() -> bool:
     finally:
         if connection.is_connected():
             connection.close()
+
+
+# =====================[ ФУНКЦИИ ДЛЯ СИСТЕМЫ МОДЕРАЦИИ НОВОСТЕЙ ] =====================
+
+async def create_news_request(
+    author_id: int,
+    content: str,
+    image_url: Optional[str] = None
+) -> Optional[int]:
+    """
+    Создаёт новую заявку на публикацию новости.
+    
+    Args:
+        author_id: ID автора новости
+        content: Текст новости
+        image_url: URL изображения (если есть)
+    
+    Returns:
+        ID созданной заявки или None при ошибке
+    """
+    connection = get_db_connection()
+    if not connection:
+        logger.error("❌ Ошибка подключения к БД при создании заявки на новость")
+        return None
+    
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """INSERT INTO news_requests (author_id, content, image_url, status) 
+               VALUES (%s, %s, %s, 'pending')""",
+            (author_id, content, image_url)
+        )
+        connection.commit()
+        request_id = cursor.lastrowid
+        logger.info(f"Создана заявка на новость #{request_id} от пользователя {author_id}")
+        return request_id
+    
+    except Error as e:
+        logger.error(f"Ошибка при создании заявки на новость: {e}")
+        connection.rollback()
+        return None
+    
+    finally:
+        if connection.is_connected():
+            connection.close()
+
+
+async def get_news_request(request_id: int) -> Optional[Dict]:
+    """
+    Получает данные заявки по ID.
+    
+    Args:
+        request_id: ID заявки
+    
+    Returns:
+        Словарь с данными заявки или None если не найдено
+    """
+    result = await fetch_one(
+        """SELECT id, author_id, content, image_url, status, moderator_id, 
+                  channel_message_id, created_at, updated_at 
+           FROM news_requests 
+           WHERE id = %s""",
+        (request_id,)
+    )
+    return result
+
+
+async def update_news_status(
+    request_id: int,
+    status: str,
+    moderator_id: int
+) -> bool:
+    """
+    Обновляет статус заявки и сохраняет ID модератора.
+    
+    Args:
+        request_id: ID заявки
+        status: Новый статус ('pending', 'approved', 'rejected')
+        moderator_id: ID модератора, который принял решение
+    
+    Returns:
+        True при успешном обновлении, False при ошибке
+    """
+    if status not in ['pending', 'approved', 'rejected']:
+        logger.error(f"Недопустимый статус: {status}")
+        return False
+    
+    return await execute_query(
+        """UPDATE news_requests 
+           SET status = %s, moderator_id = %s 
+           WHERE id = %s""",
+        (status, moderator_id, request_id)
+    )
+
+
+async def update_news_channel_message_id(
+    request_id: int,
+    channel_message_id: int
+) -> bool:
+    """
+    Сохраняет ID сообщения в канале модерации.
+    
+    Args:
+        request_id: ID заявки
+        channel_message_id: ID сообщения в Discord
+    
+    Returns:
+        True при успешном обновлении, False при ошибке
+    """
+    return await execute_query(
+        "UPDATE news_requests SET channel_message_id = %s WHERE id = %s",
+        (channel_message_id, request_id)
+    )
+
+
+async def get_user_news_requests(
+    user_id: int,
+    limit: int = 10
+) -> List[Dict]:
+    """
+    Получает последние заявки пользователя.
+    
+    Args:
+        user_id: ID пользователя
+        limit: Максимальное количество заявок для возврата
+    
+    Returns:
+        Список словарей с данными заявок
+    """
+    results = await fetch_all(
+        """SELECT id, status, moderator_id, created_at 
+           FROM news_requests 
+           WHERE author_id = %s 
+           ORDER BY created_at DESC 
+           LIMIT %s""",
+        (user_id, limit)
+    )
+    return results if results else []
+
+
+async def get_pending_news_requests() -> List[Dict]:
+    """
+    Получает все заявки со статусом 'pending'.
+    
+    Returns:
+        Список словарей с данными заявок
+    """
+    results = await fetch_all(
+        """SELECT id, author_id, content, image_url, created_at 
+           FROM news_requests 
+           WHERE status = 'pending' 
+           ORDER BY created_at ASC"""
+    )
+    return results if results else []
