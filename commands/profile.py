@@ -33,6 +33,44 @@ class Profile(commands.Cog):
         self.voice_start_times = {}  # Храним время входа в канал
         self.voice_lock = asyncio.Lock()  # Защита словаря от гонок
         self.cooldowns: Dict[tuple, float] = {}  # Ключ: (user_id, guild_id), Значение: timestamp последнего обновления
+        self._cooldown_cleanup_task = None
+    
+    async def cog_load(self):
+        """Запускает задачу по очистке cooldowns при загрузке кога."""
+        self._cooldown_cleanup_task = asyncio.create_task(self._cleanup_cooldowns())
+    
+    async def _cleanup_cooldowns(self):
+        """Периодически очищает устаревшие записи cooldowns (каждые 5 минут)."""
+        try:
+            while True:
+                await asyncio.sleep(300)  # 5 минут
+                current_time = datetime.utcnow().timestamp()
+                expired_keys = [
+                    key for key, timestamp in self.cooldowns.items()
+                    if current_time - timestamp > 600  # Удаляем записи старше 10 минут
+                ]
+                for key in expired_keys:
+                    del self.cooldowns[key]
+                if expired_keys:
+                    logger.debug(f"Очищено {len(expired_keys)} устаревших записей cooldowns")
+        except asyncio.CancelledError:
+            logger.info("Задача очистки cooldowns остановлена")
+            raise
+        except Exception as e:
+            logger.error(f"Ошибка в задаче очистки cooldowns: {e}")
+    
+    async def cog_unload(self):
+        """Останавливает задачу очистки и очищает временные данные при выгрузке кога."""
+        if self._cooldown_cleanup_task:
+            self._cooldown_cleanup_task.cancel()
+            try:
+                await self._cooldown_cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
+        self.voice_start_times.clear()
+        self.cooldowns.clear()
+        logger.info("Выгрузка кога 'Profile', очистка временных данных...")
     @commands.command(name='profile', aliases=['проф', 'профиль'])
     async def profile(self, ctx, member: discord.Member = None):
         if member is None:
@@ -315,11 +353,6 @@ class Profile(commands.Cog):
                     
         except Exception as e:
             logger.error(f"Критическая ошибка при учёте сообщения от {message.author.id}: {e}")
-  
-    def cog_unload(self):
-        self.voice_start_times.clear()
-        self.cooldowns.clear()  # Очищаем словарь охлаждения
-        logger.info("Выгрузка кога 'Profile', очистка временных данных...")
 
 # profile.py
 async def setup(bot):
