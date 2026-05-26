@@ -11,19 +11,113 @@ from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-# =====================[ КОНФИГУРАЦИЯ ] =====================
-# Вынеси в начало кода переменные для конфигурации
-TOKEN = os.getenv('DISCORD_TOKEN')
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_USER = os.getenv('DB_USER')
-DB_PASSWORD = os.getenv('DB_PASSWORD')
-DB_NAME = os.getenv('DB_NAME')
-MOD_CHANNEL_ID = int(os.getenv('MOD_CHANNEL_ID', 0))  # ID канала модерации
-NEWS_CHANNEL_ID = int(os.getenv('NEWS_CHANNEL_ID', 0))  # ID канала публикаций
-MODERATOR_ROLE_ID = int(os.getenv('MODERATOR_ROLE_ID', 0))  # ID роли модератора
-EVERYONE_TAG = os.getenv('EVERYONE_TAG', '@everyone')  # Тег для уведомления (настраиваемый)
-
 logger = logging.getLogger(__name__)
+
+
+async def get_guild_settings(guild_id: int):
+    """Получает настройки модерации для сервера из БД."""
+    from database.mysql_connector import get_moderation_settings
+    
+    settings = await get_moderation_settings(guild_id)
+    
+    if not settings:
+        # Возвращаем значения по умолчанию из переменных окружения
+        return {
+            'mod_channel_id': int(os.getenv('MOD_CHANNEL_ID', 0)),
+            'news_channel_id': int(os.getenv('NEWS_CHANNEL_ID', 0)),
+            'moderator_role_id': int(os.getenv('MODERATOR_ROLE_ID', 0)),
+            'everyone_tag': os.getenv('EVERYONE_TAG', '@everyone')
+        }
+    
+    return settings
+
+
+async def send_to_moderation_channel(
+    request_id: int,
+    author: discord.User,
+    content: str,
+    image_url: Optional[str],
+    bot: commands.Bot,
+    guild_id: Optional[int] = None
+):
+    """Отправляет заявку в канал модерации"""
+    # Получаем настройки для сервера
+    settings = await get_guild_settings(guild_id) if guild_id else await get_guild_settings(0)
+    
+    mod_channel_id = settings.get('mod_channel_id', 0)
+    
+    if mod_channel_id == 0:
+        logger.error("MOD_CHANNEL_ID не настроен!")
+        return
+    
+    try:
+        mod_channel = bot.get_channel(mod_channel_id)
+        if not mod_channel:
+            mod_channel = await bot.fetch_channel(mod_channel_id)
+        
+        # Создаём Embed с информацией о новости
+        embed = discord.Embed(
+            title="📰 Новая заявка на публикацию",
+            description=content[:4000],  # Ограничение Discord
+            color=discord.Color.orange(),
+            timestamp=datetime.now()
+        )
+        embed.add_field(name="Автор", value=f"{author.mention} (`{author.id}`)", inline=True)
+        embed.add_field(name="ID заявки", value=f"`{request_id}`", inline=True)
+        embed.set_thumbnail(url=author.display_avatar.url)
+        
+        # Добавляем картинку если есть
+        if image_url:
+            embed.set_image(url=image_url)
+        
+        # Создаём кнопки модерации
+        view = ModerationView(request_id=request_id)
+        
+        # Отправляем сообщение в канал модерации
+        message = await mod_channel.send(embed=embed, view=view)
+        
+        # Сохраняем ID сообщения в БД
+        from database.mysql_connector import update_news_channel_message_id
+        await update_news_channel_message_id(request_id, message.id)
+        
+        logger.info(f"Заявка #{request_id} отправлена в канал модерации")
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки в канал модерации: {e}")
+
+
+async def publish_news(
+    content: str,
+    image_url: Optional[str],
+    channel_id: int,
+    bot: commands.Bot,
+    everyone_tag: str = '@everyone'
+):
+    """Публикует новость в канале публикаций"""
+    if channel_id == 0:
+        logger.error("NEWS_CHANNEL_ID не настроен!")
+        return
+    
+    try:
+        news_channel = bot.get_channel(channel_id)
+        if not news_channel:
+            news_channel = await bot.fetch_channel(channel_id)
+        
+        # Формируем сообщение с тегом уведомления
+        full_content = f"{everyone_tag}\n\n{content}"
+        
+        # Отправляем сообщение
+        if image_url:
+            await news_channel.send(content=full_content)
+            # Отдельно отправляем картинку (Discord не позволяет embed + картинка в одном сообщении так просто)
+            await news_channel.send(file=discord.File(await download_image(image_url), filename="news_image.png"))
+        else:
+            await news_channel.send(content=full_content)
+        
+        logger.info(f"Новость опубликована в канале {channel_id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка публикации новости: {e}")
 
 
 class NewsSubmitModal(Modal, title="📰 Подать новость"):
@@ -382,6 +476,132 @@ class NewsModeration(commands.Cog):
         """Команда подачи новости через слэш-команду"""
         modal = NewsSubmitModal()
         await interaction.response.send_modal(modal)
+    
+    @app_commands.command(name="moderation_setup", description="Настроить систему модерации для сервера")
+    @app_commands.describe(
+        mod_channel="Канал для заявок на модерацию",
+        news_channel="Канал для публикаций новостей",
+        moderator_role="Роль модератора",
+        everyone_tag="Тег для уведомления (например @everyone или @here)"
+    )
+    async def moderation_setup(
+        self, 
+        interaction: discord.Interaction,
+        mod_channel: Optional[discord.TextChannel] = None,
+        news_channel: Optional[discord.TextChannel] = None,
+        moderator_role: Optional[discord.Role] = None,
+        everyone_tag: str = "@everyone"
+    ):
+        """
+        Команда для настройки системы модерации.
+        
+        Использование:
+        /moderation_setup [mod_channel:#канал] [news_channel:#канал] [moderator_role:@роль] [everyone_tag:@everyone]
+        
+        Все параметры необязательны - можно настроить только нужные поля.
+        """
+        from database.mysql_connector import update_moderation_settings
+        
+        # Проверка прав администратора
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "❌ Только администраторы могут настраивать систему модерации!",
+                ephemeral=True
+            )
+            return
+        
+        settings = {}
+        
+        if mod_channel:
+            settings['mod_channel_id'] = mod_channel.id
+        if news_channel:
+            settings['news_channel_id'] = news_channel.id
+        if moderator_role:
+            settings['moderator_role_id'] = moderator_role.id
+        if everyone_tag:
+            settings['everyone_tag'] = everyone_tag
+        
+        if not settings:
+            await interaction.response.send_message(
+                "⚠️ Укажите хотя бы один параметр для настройки!",
+                ephemeral=True
+            )
+            return
+        
+        success = await update_moderation_settings(interaction.guild_id, settings)
+        
+        if success:
+            embed = discord.Embed(
+                title="✅ Настройки модерации обновлены",
+                description="Система модерации успешно настроена для этого сервера.",
+                color=discord.Color.green()
+            )
+            
+            if mod_channel:
+                embed.add_field(name="📋 Канал модерации", value=mod_channel.mention, inline=True)
+            if news_channel:
+                embed.add_field(name="📢 Канал публикаций", value=news_channel.mention, inline=True)
+            if moderator_role:
+                embed.add_field(name="🛡️ Роль модератора", value=moderator_role.mention, inline=True)
+            if everyone_tag:
+                embed.add_field(name="🔔 Тег уведомления", value=f"`{everyone_tag}`", inline=True)
+            
+            await interaction.response.send_message(embed=embed)
+        else:
+            await interaction.response.send_message(
+                "❌ Не удалось сохранить настройки. Попробуйте позже.",
+                ephemeral=True
+            )
+    
+    @app_commands.command(name="moderation_settings", description="Показать текущие настройки модерации")
+    async def moderation_settings(self, interaction: discord.Interaction):
+        """Показывает текущие настройки системы модерации для сервера"""
+        settings = await get_guild_settings(interaction.guild_id)
+        
+        embed = discord.Embed(
+            title="⚙️ Настройки модерации",
+            description=f"Настройки для сервера **{interaction.guild.name}**",
+            color=discord.Color.blue()
+        )
+        
+        mod_channel_id = settings.get('mod_channel_id', 0)
+        news_channel_id = settings.get('news_channel_id', 0)
+        moderator_role_id = settings.get('moderator_role_id', 0)
+        everyone_tag = settings.get('everyone_tag', '@everyone')
+        
+        if mod_channel_id:
+            channel = interaction.guild.get_channel(mod_channel_id)
+            embed.add_field(
+                name="📋 Канал модерации",
+                value=channel.mention if channel else f"`ID: {mod_channel_id}` (канал не найден)",
+                inline=True
+            )
+        else:
+            embed.add_field(name="📋 Канал модерации", value="Не настроен", inline=True)
+        
+        if news_channel_id:
+            channel = interaction.guild.get_channel(news_channel_id)
+            embed.add_field(
+                name="📢 Канал публикаций",
+                value=channel.mention if channel else f"`ID: {news_channel_id}` (канал не найден)",
+                inline=True
+            )
+        else:
+            embed.add_field(name="📢 Канал публикаций", value="Не настроен", inline=True)
+        
+        if moderator_role_id:
+            role = interaction.guild.get_role(moderator_role_id)
+            embed.add_field(
+                name="🛡️ Роль модератора",
+                value=role.mention if role else f"`ID: {moderator_role_id}` (роль не найдена)",
+                inline=True
+            )
+        else:
+            embed.add_field(name="🛡️ Роль модератора", value="Не настроена", inline=True)
+        
+        embed.add_field(name="🔔 Тег уведомления", value=f"`{everyone_tag}`", inline=True)
+        
+        await interaction.response.send_message(embed=embed)
     
     @commands.command(name="submit", aliases=["подать"])
     async def submit_legacy(self, ctx, *, content: str = None):

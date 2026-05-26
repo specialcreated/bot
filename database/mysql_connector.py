@@ -784,6 +784,22 @@ async def init_all_tables() -> bool:
         """)
         logger.debug("Таблица news_requests проверена/создана")
         
+        # Таблица moderation_settings (настройки системы модерации)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS moderation_settings (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                guild_id BIGINT NOT NULL UNIQUE,
+                mod_channel_id BIGINT NULL,
+                news_channel_id BIGINT NULL,
+                moderator_role_id BIGINT NULL,
+                everyone_tag VARCHAR(50) DEFAULT '@everyone',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_guild (guild_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        logger.debug("Таблица moderation_settings проверена/создана")
+        
         connection.commit()
         logger.info("✅ Все таблицы базы данных проверены/созданы")
         return True
@@ -1230,3 +1246,131 @@ async def get_pending_news_requests() -> List[Dict]:
            ORDER BY created_at ASC"""
     )
     return results if results else []
+
+
+# =====================[ ФУНКЦИИ ДЛЯ НАСТРОЕК МОДЕРАЦИИ ] =====================
+
+async def get_moderation_settings(guild_id: int) -> Optional[Dict]:
+    """
+    Получает настройки модерации для сервера.
+    
+    Args:
+        guild_id: ID сервера Discord
+    
+    Returns:
+        Словарь с настройками или None если не найдено
+    """
+    result = await fetch_one(
+        """SELECT mod_channel_id, news_channel_id, moderator_role_id, everyone_tag 
+           FROM moderation_settings 
+           WHERE guild_id = %s""",
+        (guild_id,)
+    )
+    return result
+
+
+async def update_moderation_settings(guild_id: int, settings: Dict[str, any]) -> bool:
+    """
+    Обновляет или создаёт настройки модерации для сервера.
+    
+    Args:
+        guild_id: ID сервера Discord
+        settings: Словарь с настройками для обновления, например:
+            {"mod_channel_id": 123456789, "news_channel_id": 987654321}
+    
+    Returns:
+        bool: True при успешном обновлении/создании, False при ошибке
+    """
+    loop = asyncio.get_event_loop()
+    success = await loop.run_in_executor(
+        None,
+        _sync_update_moderation_settings,
+        guild_id,
+        settings
+    )
+    return success
+
+
+def _sync_update_moderation_settings(guild_id: int, settings: Dict[str, any]) -> bool:
+    """Синхронный метод для обновления настроек модерации."""
+    connection = get_db_connection()
+    if not connection:
+        logger.error("❌ Ошибка подключения к БД при обновлении настроек модерации")
+        return False
+
+    try:
+        cursor = connection.cursor()
+
+        # Проверяем, существует ли запись для этого сервера
+        cursor.execute(
+            "SELECT guild_id FROM moderation_settings WHERE guild_id = %s",
+            (guild_id,)
+        )
+        exists = cursor.fetchone() is not None
+
+        # Валидация имён полей для предотвращения SQL-инъекций
+        allowed_fields = {
+            'mod_channel_id', 'news_channel_id', 
+            'moderator_role_id', 'everyone_tag'
+        }
+        
+        validated_settings = {}
+        for field, value in settings.items():
+            if field not in allowed_fields:
+                logger.warning(f"Попытка обновления недопустимого поля: {field}")
+                continue
+            validated_settings[field] = value
+
+        if not validated_settings:
+            logger.error("Нет допустимых полей для обновления")
+            return False
+
+        if exists:
+            # Обновляем существующие настройки
+            set_clause = ", ".join([f"{field} = %s" for field in validated_settings.keys()])
+            values = list(validated_settings.values())
+            values.append(guild_id)
+
+            cursor.execute(
+                f"UPDATE moderation_settings SET {set_clause} WHERE guild_id = %s",
+                values
+            )
+            logger.info(f"Обновлены настройки модерации сервера {guild_id}: {validated_settings}")
+        else:
+            # Создаём новую запись
+            fields = ["guild_id"] + list(validated_settings.keys())
+            placeholders = ", ".join(["%s"] * len(fields))
+            values = [guild_id] + list(validated_settings.values())
+
+            cursor.execute(
+                f"INSERT INTO moderation_settings ({', '.join(fields)}) VALUES ({placeholders})",
+                values
+            )
+            logger.info(f"Созданы новые настройки модерации сервера {guild_id}: {validated_settings}")
+
+        connection.commit()
+        return True
+
+    except Error as e:
+        logger.error(f"Ошибка при обновлении настроек модерации {guild_id}: {e}")
+        connection.rollback()
+        return False
+    finally:
+        if connection.is_connected():
+            connection.close()
+
+
+async def reset_moderation_settings(guild_id: int) -> bool:
+    """
+    Сбрасывает настройки модерации для сервера к значениям по умолчанию.
+    
+    Args:
+        guild_id: ID сервера Discord
+    
+    Returns:
+        bool: True при успешном сбросе, False при ошибке
+    """
+    return await execute_query(
+        "DELETE FROM moderation_settings WHERE guild_id = %s",
+        (guild_id,)
+    )
