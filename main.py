@@ -24,13 +24,16 @@ bot = commands.Bot(
 )
 
 #=====================[ Словари ] =====================
-voice_times = {}  # Пустой словарь для хранения времени входа в каналы
+voice_times = {}  # Пустой словарь для хранения времени входа в каналы (теперь не используется, перемещён в Profile cog)
 
 #=====================[ Загрузка ENV ] =====================
 load_dotenv()
 
 #=====================[ Импорт функций БД ] =====================
 from database.mysql_connector import init_all_tables
+
+#=====================[ Импорт rate limiter ] =====================
+from utils.rate_limiter import global_rate_limiter
 
 #=====================[ Настройки логов ] =====================
 logging.basicConfig(
@@ -105,6 +108,10 @@ async def on_ready():
     try:
         await load_cogs()
         print(f'✓ Загружено cogs: {list(bot.cogs.keys())}')
+        
+        # Запускаем задачу очистки rate limiter
+        await global_rate_limiter.start_cleanup_task()
+        print('✓ Rate limiter запущен')
     except Exception as e:
         logger.error(f'❌ Ошибка инициализации: {e}')
 

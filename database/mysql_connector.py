@@ -2,12 +2,14 @@ import mysql.connector
 from mysql.connector import Error
 import os
 from dotenv import load_dotenv
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import asyncio
 import logging
 from datetime import datetime
 from mysql.connector.pooling import MySQLConnectionPool
 import json
+import threading
+from collections import defaultdict
 
 # Настройка логгера (без basicConfig, чтобы не переопределять настройки из main.py)
 logger = logging.getLogger(__name__)
@@ -32,6 +34,10 @@ connection_pool = MySQLConnectionPool(
     pool_reset_session=True,
     **DB_CONFIG
 )
+
+# Блокировки для предотвращения race condition
+_user_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+_global_db_lock = threading.Lock()
 
 def get_db_connection():
     """Получает соединение из пула."""
@@ -78,15 +84,20 @@ def _sync_get_user_profile(user_id: int, guild_id: int) -> Optional[Dict]:
         if connection.is_connected():
             connection.close()
 async def update_user_xp(user_id: int, guild_id: int, xp_gain: int) -> Optional[Dict]:
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None,
-        _sync_update_user_xp,
-        user_id,
-        guild_id,
-        xp_gain
-    )
-    return result
+    """Асинхронно обновляет XP пользователя с блокировкой для предотвращения race condition."""
+    # Получаем блокировку для конкретного пользователя
+    lock = _user_locks[user_id]
+    
+    async with lock:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            _sync_update_user_xp,
+            user_id,
+            guild_id,
+            xp_gain
+        )
+        return result
 
 def _sync_update_user_xp(user_id: int, guild_id: int, xp_gain: int) -> Optional[Dict]:
     connection = get_db_connection()
@@ -333,28 +344,48 @@ def _sync_update_server_settings(guild_id: int, settings: Dict[str, int]) -> boo
         )
         exists = cursor.fetchone() is not None
 
+        # Валидация имён полей для предотвращения SQL-инъекций
+        allowed_fields = {
+            'welcome_channel_id', 'goodbye_channel_id', 
+            'log_channel_id', 'mod_log_channel_id'
+        }
+        
+        validated_settings = {}
+        for field, value in settings.items():
+            if field not in allowed_fields:
+                logger.warning(f"Попытка обновления недопустимого поля: {field}")
+                continue
+            if not isinstance(value, int):
+                logger.warning(f"Недопустимое значение для поля {field}: {value}")
+                continue
+            validated_settings[field] = value
+
+        if not validated_settings:
+            logger.error("Нет допустимых полей для обновления")
+            return False
+
         if exists:
-            # Обновляем существующие настройки
-            set_clause = ", ".join([f"{field} = %s" for field in settings.keys()])
-            values = list(settings.values())
+            # Обновляем существующие настройки с валидированными полями
+            set_clause = ", ".join([f"{field} = %s" for field in validated_settings.keys()])
+            values = list(validated_settings.values())
             values.append(guild_id)
 
             cursor.execute(
                 f"UPDATE server_settings SET {set_clause} WHERE guild_id = %s",
                 values
             )
-            logger.info(f"Обновлены настройки сервера {guild_id}: {settings}")
+            logger.info(f"Обновлены настройки сервера {guild_id}: {validated_settings}")
         else:
-            # Создаём новую запись
-            fields = ["guild_id"] + list(settings.keys())
+            # Создаём новую запись с валидированными полями
+            fields = ["guild_id"] + list(validated_settings.keys())
             placeholders = ", ".join(["%s"] * len(fields))
-            values = [guild_id] + list(settings.values())
+            values = [guild_id] + list(validated_settings.values())
 
             cursor.execute(
                 f"INSERT INTO server_settings ({', '.join(fields)}) VALUES ({placeholders})",
                 values
             )
-            logger.info(f"Созданы новые настройки сервера {guild_id}: {settings}")
+            logger.info(f"Созданы новые настройки сервера {guild_id}: {validated_settings}")
 
         connection.commit()
         return True
